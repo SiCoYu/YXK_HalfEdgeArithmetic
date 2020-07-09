@@ -117,19 +117,31 @@ void convertToRaster(
 )
 {
     Vec3f vertexCamera;
-
+	//将顶点从世界坐标转到相机坐标（视坐标）
     worldToCamera.multVecMatrix(vertexWorld, vertexCamera);
-    
-    // convert to screen space
+
+	//在把视锥体压缩成长方体的过程中，我们规定三个规则
+	//1.近平面的所有点坐标不变
+	//2.远平面的所有点坐标z值不变 都是f
+	//3.远平面的中心点坐标值不变 为(0, 0, f)
+	//正交矩阵和透视矩阵的推导，请参照https://zhuanlan.zhihu.com/p/122411512
+
+    // convert to screen space，符合规则1，其实是将是椎体转化成长方体，其中一个面是近平面。
+	// 假设相机和顶点在近平面的交点坐标为(Nx,Ny)，根据相似三角形, Near/Vz = Nx/Vx，Near/Vz = Ny/Vy
+	// Nx = Near*Vx/Vz Ny = Near*Vy/Vz
+	// 第一步将视椎体正交化
     Vec2f vertexScreen;
     vertexScreen.x = near * vertexCamera.x / -vertexCamera.z;
     vertexScreen.y = near * vertexCamera.y / -vertexCamera.z;
     
+	// 透视矩阵，其实是将长方体映射到[-1,1]的正方体中，即现将视椎体正交化成长方体，在将长方体映射到正方体，注意是矩阵左乘屏幕坐标点。
     // now convert point from screen space to NDC space (in range [-1,1])
+	// 第二步将正交化后的长方体在映射到[-1,1]的正方体
     Vec2f vertexNDC;
     vertexNDC.x = 2 * vertexScreen.x / (r - l) - (r + l) / (r - l);
     vertexNDC.y = 2 * vertexScreen.y / (t - b) - (t + b) / (t - b);
 
+	// 映射到光栅化空间，即从[-1,1]映射为[0,1]，因为贴图等信息都是[0-1]
     // convert to raster space
     vertexRaster.x = (vertexNDC.x + 1) / 2 * imageWidth;
     // in raster space y is down so invert direction
@@ -185,13 +197,16 @@ int main(int argc, char **argv)
     // [comment]
     // Outer loop
     // [/comment]
+	// cow一共有ntris=3156个顶点，对这3156个顶点进行光栅化
     for (uint32_t i = 0; i < ntris; ++i) {
-        const Vec3f &v0 = vertices[nvertices[i * 3]];
+        // 取出三角形顶点
+		const Vec3f &v0 = vertices[nvertices[i * 3]];
         const Vec3f &v1 = vertices[nvertices[i * 3 + 1]];
         const Vec3f &v2 = vertices[nvertices[i * 3 + 2]];
         
         // [comment]
         // Convert the vertices of the triangle to raster space
+		// 将顶点从物体坐标->世界坐标->视坐标（相机坐标）->屏幕坐标
         // [/comment]
         Vec3f v0Raster, v1Raster, v2Raster;
         convertToRaster(v0, worldToCamera, l, r, t, b, nearClippingPLane, imageWidth, imageHeight, v0Raster);
@@ -209,50 +224,61 @@ int main(int argc, char **argv)
         // [comment]
         // Prepare vertex attributes. Divde them by their vertex z-coordinate
         // (though we use a multiplication here because v.z = 1 / v.z)
+		// 取出顶点属性
         // [/comment]
         Vec2f st0 = st[stindices[i * 3]];
         Vec2f st1 = st[stindices[i * 3 + 1]];
         Vec2f st2 = st[stindices[i * 3 + 2]];
 
         st0 *= v0Raster.z, st1 *= v1Raster.z, st2 *= v2Raster.z;
-    
+		
+		// 计算三角形包围盒，为光栅化做准备
         float xmin = min3(v0Raster.x, v1Raster.x, v2Raster.x);
         float ymin = min3(v0Raster.y, v1Raster.y, v2Raster.y);
         float xmax = max3(v0Raster.x, v1Raster.x, v2Raster.x);
         float ymax = max3(v0Raster.y, v1Raster.y, v2Raster.y);
         
-        // the triangle is out of screen
+        // the triangle is out of screen，判断点不在屏幕范围内，因为v0Raster, v1Raster, v2Raster已经是屏幕坐标，所以通过和屏幕分辨率比较数值即可判断
         if (xmin > imageWidth - 1 || xmax < 0 || ymin > imageHeight - 1 || ymax < 0) continue;
 
+		// 计算光栅化遍历起点和终点
         // be careful xmin/xmax/ymin/ymax can be negative. Don't cast to uint32_t
         uint32_t x0 = std::max(int32_t(0), (int32_t)(std::floor(xmin)));
         uint32_t x1 = std::min(int32_t(imageWidth) - 1, (int32_t)(std::floor(xmax)));
         uint32_t y0 = std::max(int32_t(0), (int32_t)(std::floor(ymin)));
         uint32_t y1 = std::min(int32_t(imageHeight) - 1, (int32_t)(std::floor(ymax)));
 
+		// 使用半边函数(HalfFunction，相关论文参考REAMME.md)，注意叉乘在二维空间里表示的是平行四边形的面积
         float area = edgeFunction(v0Raster, v1Raster, v2Raster);
         
         // [comment]
-        // Inner loop
+        // Inner loop，开始光栅化
         // [/comment]
         for (uint32_t y = y0; y <= y1; ++y) {
             for (uint32_t x = x0; x <= x1; ++x) {
                 Vec3f pixelSample(x + 0.5, y + 0.5, 0);
+				// 分别计算光栅化过程中，像素点在不在三角形内部，由于使用的是最普通的划线算法，即遍历整个包围盒内的所有像素点，关于优化可以参考REAMME.md
                 float w0 = edgeFunction(v1Raster, v2Raster, pixelSample);
                 float w1 = edgeFunction(v2Raster, v0Raster, pixelSample);
                 float w2 = edgeFunction(v0Raster, v1Raster, pixelSample);
+				// 如果点在三条边内部，则处理该像素点
                 if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+					// 计算三角形被中心点分割后的三个Child三角形的面积比率，即差值时的权重
                     w0 /= area;
                     w1 /= area;
                     w2 /= area;
+					// 计算该像素点出的深度Z
                     float oneOverZ = v0Raster.z * w0 + v1Raster.z * w1 + v2Raster.z * w2;
-                    float z = 1 / oneOverZ;
+					// 计算该像素点出的深度Z，因为在上面步骤中对屏幕空间的z已经取倒数，为了计算准确的深度值，此处又取了一次倒数
+					float z = 1 / oneOverZ;
                     // [comment]
                     // Depth-buffer test
+					// 深度测试，如果通过深度测试，则进行着色、灯光等响应计算
                     // [/comment]
                     if (z < depthBuffer[y * imageWidth + x]) {
-                        depthBuffer[y * imageWidth + x] = z;
-                        
+						// 更新Z buffer
+						depthBuffer[y * imageWidth + x] = z;
+                        // 计算顶点属性差值
                         Vec2f st = st0 * w0 + st1 * w1 + st2 * w2;
                         
                         st *= z;
@@ -265,13 +291,14 @@ int main(int argc, char **argv)
                         // by sample depth.
                         // [/comment]
                         Vec3f v0Cam, v1Cam, v2Cam;
+						// 将顶点从世界坐标转到视坐标（相机坐标）
                         worldToCamera.multVecMatrix(v0, v0Cam);
                         worldToCamera.multVecMatrix(v1, v1Cam);
                         worldToCamera.multVecMatrix(v2, v2Cam);
-                        
+                        //计算屏幕近平面上交点坐标
                         float px = (v0Cam.x/-v0Cam.z) * w0 + (v1Cam.x/-v1Cam.z) * w1 + (v2Cam.x/-v2Cam.z) * w2;
                         float py = (v0Cam.y/-v0Cam.z) * w0 + (v1Cam.y/-v1Cam.z) * w1 + (v2Cam.y/-v2Cam.z) * w2;
-                        
+						// 计算视空间下，点的位置
                         Vec3f pt(px * z, py * z, -z); // pt is in camera space
                         
                         // [comment]
@@ -280,9 +307,11 @@ int main(int argc, char **argv)
                         // Thus the view direction can be computed as the point on the object
                         // in camera space minus Vec3f(0), the position of the camera in camera
                         // space.
+						// 计算法线
                         // [/comment]
                         Vec3f n = (v1Cam - v0Cam).crossProduct(v2Cam - v0Cam);
                         n.normalize();
+						// 计算入射方向
                         Vec3f viewDirection = -pt;
                         viewDirection.normalize();
                         
@@ -292,11 +321,14 @@ int main(int argc, char **argv)
                         // The final color is the reuslt of the faction ration multiplied by the
                         // checkerboard pattern.
                         // [/comment]
+						// 设置棋盘格尺寸为10个格子
                         const int M = 10;
+						// 绘制棋盘格，左上右下同色，左下右上同色，
                         float checker = (fmod(st.x * M, 1.0) > 0.5) ^ (fmod(st.y * M, 1.0) < 0.5);
                         float c = 0.3 * (1 - checker) + 0.7 * checker;
                         nDotView *= c;
 						int val = std::floorf(nDotView * 255);
+						// 将颜色值写入FrameBuffer
                         frameBuffer[y * imageWidth + x].x = val;
                         frameBuffer[y * imageWidth + x].y = val;
                         frameBuffer[y * imageWidth + x].z = val;
